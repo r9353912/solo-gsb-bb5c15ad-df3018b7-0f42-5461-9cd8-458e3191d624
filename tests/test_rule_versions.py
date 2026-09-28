@@ -281,10 +281,26 @@ def test_history_is_immutable_after_later_modifications(client):
             "effective_seq": 5})
     submit_payloads(client, "dev-a", [(5, {"hum": 99})])  # v3 alert
 
-    # the original alert is byte-for-byte unchanged: still v1 + v1 snapshot
+    # the original alert snapshot is unchanged: still v1 + v1 snapshot and
+    # the same acknowledgement state. The only addition is the *separate*
+    # segment-end record written when v2 first took over at seq 3; the alert
+    # row itself is never rewritten.
     after = alerts(client, rule_id=rule["rule_id"], version_no=1)
     assert len(after) == 1
-    assert after[0] == before
+    assert before["ending"] is None
+    snapshot_keys = [
+        "alert_id", "rule_id", "rule_version_id", "version_no", "device_id",
+        "field", "op", "threshold", "consecutive", "start_seq", "end_seq",
+        "trigger_value", "created_at", "status", "acknowledged_by",
+        "acknowledged_at",
+    ]
+    assert {k: after[0][k] for k in snapshot_keys} == {
+        k: before[k] for k in snapshot_keys
+    }
+    assert after[0]["ending"] == {
+        "end_seq": 3, "end_reason": "version", "ended_at": after[0]["ending"]["ended_at"]
+    }
+    assert after[0]["ending"]["ended_at"] >= before["created_at"]
     assert after[0]["field"] == "temp"
     assert after[0]["op"] == "gt"
 

@@ -25,7 +25,12 @@ Semantics
 
 Every first-time transition to `committed` (direct commit or buffered drain)
 feeds the device's alert rules in ascending seq order, and declaring a gap
-breaks their consecutive runs (see alerts.py).
+breaks their consecutive runs (see alerts.py). The same commit path also
+finishes a fired anomaly segment: the first committed in-range /
+missing-field / non-numeric record ends it (reason `record`), a declared gap
+ends it (reason `gap`) and the first record a newer rule version takes over
+ends it (reason `version`). Duplicates, still-buffered records and gap_filled
+backfills never reach that path, so they cannot end a segment early.
 
 All public methods must be called inside a write transaction (db.write_txn),
 so concurrent batches for the same device serialize through SQLite.

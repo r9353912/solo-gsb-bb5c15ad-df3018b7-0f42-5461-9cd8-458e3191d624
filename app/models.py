@@ -128,6 +128,15 @@ class AlertVersionList(BaseModel):
     versions: list[AlertVersionOut]
 
 
+class AlertEndingOut(BaseModel):
+    # Separate end record of the anomaly segment. Stored independently from
+    # the alert: the alert snapshot and its acknowledgement stay untouched.
+    # null while the segment is still active.
+    end_seq: int   # first committed seq after the violating segment
+    end_reason: Literal["record", "gap", "version"]
+    ended_at: float
+
+
 class AlertOut(BaseModel):
     alert_id: int
     rule_id: int
@@ -150,6 +159,11 @@ class AlertOut(BaseModel):
     status: Literal["open", "acknowledged"]
     acknowledged_by: Optional[str] = None
     acknowledged_at: Optional[float] = None
+    # Separate segment-end record; null while the anomaly segment is active.
+    # The segment ends exactly once: at the first committed in-range /
+    # missing-field / non-numeric record ('record'), when a gap is declared
+    # ('gap') or when a newer rule version first takes over ('version').
+    ending: Optional[AlertEndingOut] = None
 
 
 class AlertAckIn(BaseModel):

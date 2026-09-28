@@ -14,6 +14,12 @@ wide `alert_rules` shape, with or without the acknowledgement columns on
 `alerts`) are upgraded in place by init_db: each old rule becomes version 1
 (effective from seq 0), its state row is carried over and every historical
 alert is pinned to that version.
+
+Fired anomaly segments get a separate end record (`alert_ends`): the alert
+row and its acknowledgement state are never rewritten, the end (seq, time,
+reason) lives in its own one-row-per-alert table. The table is created with
+IF NOT EXISTS, so an existing volume simply gains it on startup and its
+historical alerts stay active until a future event ends them.
 """
 from __future__ import annotations
 
@@ -123,6 +129,25 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id, id);
 -- idx_alerts_version is created after startup migrations: an old alerts table
 -- has no version_id column until _migrate_rule_versioning adds it.
+
+-- End of the anomaly segment that produced an alert. The end record is
+-- stored *separately* from the alert on purpose: the alert snapshot and its
+-- acknowledgement workflow never change, while the segment can be finished
+-- exactly once. PRIMARY KEY (alert_id) enforces "at most one end per alert"
+-- at the storage level even under concurrent writers; ON DELETE CASCADE
+-- removes it together with its alert (rule deletion path).
+--   reason 'record'  : the next committed record was in-range/had a missing
+--                      field/had a non-numeric value; end_seq is that record;
+--   reason 'gap'     : a gap (断档) was declared before any closing record;
+--                      end_seq is the first seq after the declared hole
+--                      (where evaluation resumes);
+--   reason 'version' : a newer rule version took over evaluation at end_seq.
+CREATE TABLE IF NOT EXISTS alert_ends (
+    alert_id   INTEGER PRIMARY KEY REFERENCES alerts (id) ON DELETE CASCADE,
+    end_seq    INTEGER NOT NULL,           -- first committed seq of the new state
+    end_reason TEXT NOT NULL CHECK (end_reason IN ('record', 'gap', 'version')),
+    ended_at   REAL NOT NULL
+);
 """
 
 # Idempotent column migrations for databases created before the alerts table

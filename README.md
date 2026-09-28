@@ -1,6 +1,6 @@
 # 设备遥测接收 API（device-telemetry-ingest）
 
-基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置**版本化告警规则**（修改规则即追加递增版本、可指定生效序列号，历史版本与已生成告警永久冻结），对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。
+基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置**版本化告警规则**（修改规则即追加递增版本、可指定生效序列号，历史版本与已生成告警永久冻结），对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。每条触发告警的**异常区段**还会单独记录一次**结束信息**（结束序号、时间与原因 `record`/`gap`/`version`），原告警快照与确认状态均不改变；告警查询返回结束信息并支持 `active`（区段是否仍在持续）过滤。
 
 ## 快速启动
 
@@ -30,6 +30,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过命名卷 `telemetry-data` 持久化。升级到新镜像时，启动初始化会自动为旧库做幂等迁移，无需手动干预；但请仍按惯例在升级前备份卷内数据库：
 
 - 旧库的 `alerts` 表自动补齐 `status`/`acknowledged_by`/`acknowledged_at` 列（历史告警视为 `open`）。
+- **异常区段结束表 `alert_ends`**：旧库启动时自动 `CREATE TABLE IF NOT EXISTS` 新建；既有历史告警默认仍为“进行中”（查询中 `ending` 为 `null`），只有之后发生结束事件时才写入结束记录。
 - **规则版本化迁移**：旧的宽表 `alert_rules`（参数直接存于规则行）会重建为“规则序列 + 不可变版本”结构——每条旧规则成为 **版本 1（自 seq 0 生效）**，原有的规则推进状态迁移到该版本，全部历史告警固定（pin）到版本 1；迁移结束做 `foreign_key_check` 校验，重复启动安全。
 
 ## 配置项（环境变量）
@@ -73,6 +74,23 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 同一连续区段不再重复生成；待计数中断（恢复正常）后，下一段连续越限才会再次触发。
 规则创建前已提交的历史记录不回溯计算。
 
+**异常区段的结束记录**：一条告警生成时只代表“连续越限区段已达到 N 条并触发”，该区段此后仍
+处于**进行中（active）**，直到真正中断。结束信息**单独持久化**在 `alert_ends` 表（与告警行
+分离），包含**结束序号 `end_seq`、结束时间 `ended_at`、结束原因 `end_reason`**；**每条告警最多
+结束一次**（`alert_ends.alert_id` 主键在存储层保证），原告警的参数快照与确认状态
+（`status`/`acknowledged_by`/`acknowledged_at`）**保持不变**。结束原因有三种：
+
+- `record`：触发后**首次提交**的**未越限**记录（恢复正常），或该记录的监听字段**缺失 / 非数值**
+  （布尔、字符串、`null`、`NaN`/`Infinity` 等）结束区段；`end_seq` 即这条记录序号。
+- `gap`：区段进行中**声明断档**时结束；`end_seq` 为缺口之后、评估重新开始的第一条记录序号
+  （即断档跳转目标 `at_seq`）。
+- `version`：规则**新版本首次接管**一条已提交记录时，结束被取代旧版本正在进行的区段；
+  `end_seq` 为新版本接管的首条记录序号。
+
+结束同样只由**首次转为 `committed`** 的提交路径按序推进：**重复上报、仍处于 `buffered` 的记录、
+`gap_filled` 断档补录都不会提前结束区段**。从未中断的区段（例如设备一直越限且规则不再变更）
+将一直保持 active，其告警没有结束记录（响应中 `ending` 为 `null`）。
+
 **告警规则版本化**：规则（rule series）创建后即拥有**版本 1（自 seq 0 生效）**。修改规则不是覆盖，而是**追加一个不可变新版本**：版本号在该规则内严格递增（1、2、3…），并可指定该版本的**生效序列号 `effective_seq`**（省略时取设备当前 `next_expected`，即在提交前沿切换）。某条记录首次转为 committed 时，引擎按该记录的 seq 原子选择唯一生效版本：
 
 ```sql
@@ -84,8 +102,8 @@ ORDER BY effective_seq DESC LIMIT 1
 数据库层的 `UNIQUE(rule_id, effective_seq)` 与规则内版本号唯一约束保证：同一 seq 下版本选择**唯一且无歧义**；`effective_seq` 必须**严格递增、且不得早于设备已提交前沿 `next_expected`**（允许指向仍在 buffered 区的 seq，但不允许回填已提交历史）。新版本从自己的生效 seq 开始、以**独立 streak（计数清零）**推进；被取代的旧版本的定义与状态（`last_seq`/`streak`/`alerted`）永久冻结。因此：
 
 - **并发批次提交**、以及一次提交冲刷多条 buffered 记录时，每条记录都在同一 `BEGIN IMMEDIATE` 事务内按记录序号选择版本——修改与提交在 SQLite 写层串行化，要么某 seq 用旧版本、要么用新版本，绝不会半旧半新；两个并发修改也串行，后到者拿到下一个版本号且必须使用更大的生效序号（冲突返回 **409**）。
-- **历史版本与已生成告警保持不变**：每条告警在生成时固定（pin）到产生它的版本（`rule_version_id` + `version_no`）并保留该版本的参数快照（field/op/threshold/consecutive），之后再如何修改规则都不会改写既有版本与告警行。
-- **断档（断档）与版本**：声明断档会重置“仍可能推进记录”的版本（在跳转 seq 生效的版本及更晚版本）；已完全被取代的旧版本保持冻结。
+- **历史版本与已生成告警保持不变**：每条告警在生成时固定（pin）到产生它的版本（`rule_version_id` + `version_no`）并保留该版本的参数快照（field/op/threshold/consecutive），之后再如何修改规则都不会改写既有版本与告警行。新版本**首次接管**已提交记录时，仅会在独立的 `alert_ends` 表为旧版本“进行中”的区段补一条原因 `version` 的结束记录（不改动告警本身）；旧版本此前已结束的区段不会被重复结束。
+- **断档（断档）与版本**：声明断档会重置“仍可能推进记录”的版本（在跳转 seq 生效的版本及更晚版本）并为这些版本进行中的区段写入原因 `gap` 的结束记录；已完全被取代的旧版本保持冻结（其进行中区段由新版本接管时以原因 `version` 结束）。
 
 **告警确认工作流**：每条告警生成时状态为 `open`，并带 `acknowledged_by`/`acknowledged_at`
 两个空字段。运维方可按告警 ID 调用确认接口，将其置为 `acknowledged` 并记录**确认人标识**
@@ -311,12 +329,14 @@ GET /api/v1/devices/{device_id}/alert-rules/{rule_id}/versions
 GET /api/v1/devices/{device_id}/alerts
 GET /api/v1/devices/{device_id}/alerts?rule_id=1
 GET /api/v1/devices/{device_id}/alerts?status=open
+GET /api/v1/devices/{device_id}/alerts?active=true
 GET /api/v1/devices/{device_id}/alerts?rule_id=1&version_no=2
 GET /api/v1/devices/{device_id}/alerts?rule_version_id=2
 GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
+GET /api/v1/devices/{device_id}/alerts?active=false&status=acknowledged
 ```
 
-`rule_id`、`status`、`version_no`、`rule_version_id` 均为可选过滤，可组合使用：
+`rule_id`、`status`、`version_no`、`rule_version_id`、`active` 均为可选过滤，可组合使用：
 
 | 参数 | 说明 |
 |---|---|
@@ -324,11 +344,14 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
 | `version_no` | 仅返回该规则**指定版本号**产生的告警；**必须与 `rule_id` 同时提供**（否则 400） |
 | `rule_version_id` | 按全局唯一的规则版本 id 过滤（无需 `rule_id`） |
 | `status` | `open`（未确认）/ `acknowledged`（已确认）；不传则保留**全部历史** |
+| `active` | `true` = 仅返回**异常区段仍在进行**（尚无结束记录）的告警；`false` = 仅返回**已结束**的告警；不传则不过滤。与 `status` **相互独立、可组合**（确认状态不影响区段是否 active） |
 
 每条告警记录越限区段的 `start_seq`/`end_seq`（end 为达到连续条数
 的那条记录）、触发值 `trigger_value`、产生它的版本（`rule_version_id`/`version_no`）、
 规则快照（field/op/threshold/consecutive）
 以及确认工作流字段（`status`、`acknowledged_by`、`acknowledged_at`）。
+此外每条告警带一个独立的**结束信息对象 `ending`**：区段进行中为 `null`；结束后包含
+`end_seq`（结束序号）、`end_reason`（`record`/`gap`/`version`）与 `ended_at`（结束时间）。
 过滤只筛选行，响应始终保留告警的全部字段：
 
 ```json
@@ -351,11 +374,41 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
       "created_at": 1758000000.34,
       "status": "open",
       "acknowledged_by": null,
-      "acknowledged_at": null
+      "acknowledged_at": null,
+      "ending": null
+    },
+    {
+      "alert_id": 2,
+      "rule_id": 1,
+      "rule_version_id": 1,
+      "version_no": 1,
+      "device_id": "dev-001",
+      "field": "temp",
+      "op": "gt",
+      "threshold": 30.0,
+      "consecutive": 3,
+      "start_seq": 8,
+      "end_seq": 10,
+      "trigger_value": 33.0,
+      "created_at": 1758000020.0,
+      "status": "acknowledged",
+      "acknowledged_by": "ops-bob",
+      "acknowledged_at": 1758000025.5,
+      "ending": {
+        "end_seq": 11,
+        "end_reason": "record",
+        "ended_at": 1758000030.1
+      }
     }
   ]
 }
 ```
+
+上例中：告警 1 的区段仍在进行（`active`，`ending` 为 `null`）；告警 2 的区段在 seq 11 因
+一条未越限记录而结束（`end_reason: "record"`）。声明断档结束时 `end_reason` 为 `gap`
+（`end_seq` 为缺口后重新评估的首条序号）；新版本首次接管结束时为 `version`
+（`end_seq` 为新版本接管的首条序号）。结束记录与确认互不影响：确认一条 active 告警后
+它仍可用 `active=true` 查到，而一条已结束的 open 告警只出现在 `active=false` 中。
 
 ### 确认告警
 
@@ -452,8 +505,19 @@ curl -X POST localhost:8000/api/v1/batches -H 'Content-Type: application/json' -
               {"seq":9,"payload":{"temp":33}}]
 }'
 curl localhost:8000/api/v1/devices/dev-001/alerts
-# -> alerts[0]: start_seq=7, end_seq=9, trigger_value=33.0, status=open
-#    同一连续区段不再重复告警；恢复正常（未越限/字段缺失/声明断档）后才可再次触发
+# -> alerts[0]: start_seq=7, end_seq=9, trigger_value=33.0, status=open, ending=null（区段进行中）
+#    同一连续区段不再重复告警；恢复正常（未越限/字段缺失/声明断档/新版本接管）后区段结束并可再次触发
+
+# 9b. 上报一条未越限记录 -> 上述区段以 reason=record 在 seq 10 结束（仅写 alert_ends，告警本身不变）
+curl -X POST localhost:8000/api/v1/batches -H 'Content-Type: application/json' -d '{
+  "device_id": "dev-001",
+  "records": [{"seq":10,"payload":{"temp":21}}]
+}'
+curl localhost:8000/api/v1/devices/dev-001/alerts
+# -> alerts[0].ending = {"end_seq": 10, "end_reason": "record", "ended_at": ...}
+# 只看待结束 / 已结束的区段（与 status 确认状态相互独立、可组合）：
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?active=true'
+curl 'localhost:8000/api/v1/devices/dev-001/alerts?active=false'
 
 # 10. 确认告警：记录确认人与确认时间；重复/并发确认幂等，首次确认信息不变
 curl -X POST localhost:8000/api/v1/devices/dev-001/alerts/1/acknowledge \
@@ -494,9 +558,9 @@ curl -X PUT localhost:8000/api/v1/devices/dev-001/alert-rules/1 \
 ```
 app/
   config.py   # 环境变量配置
-  db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）与启动迁移（规则版本化）
+  db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）与启动迁移（规则版本化、alert_ends 建表）
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
-  alerts.py   # 版本化连续阈值告警引擎（版本追加/按 seq 原子选版/规则推进/断档中断/告警生成）
+  alerts.py   # 版本化连续阈值告警引擎（版本追加/按 seq 原子选版/规则推进/断档中断/告警生成/异常区段结束 record·gap·version）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
@@ -504,6 +568,7 @@ tests/
   test_api.py          # 乱序/幂等/断档/重放/回锚/并发一致性测试
   test_records.py      # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
   test_alerts.py       # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算/确认工作流/迁移测试
+  test_alert_ends.py   # 异常区段结束：record/gap/version 结束/最多一次/buffered·duplicate·gap_filled 不提前结束/active 过滤/旧库建表/并发
   test_rule_versions.py # 规则版本化：版本切换/按 seq 唯一选版/历史冻结/迁移/真实服务并发测试
 Dockerfile
 docker-compose.yml
@@ -530,6 +595,14 @@ pytest tests/ -q
 历史字段、重复确认幂等且不改首次确认信息（换人也不可覆盖）、按状态筛选（可与 rule_id
 组合，非法值 422）、未知/跨设备告警 404、请求体校验、旧版 SQLite 库启动自动迁移，
 以及真实 uvicorn 服务下 16 并发确认单条告警时唯一确认人胜出、所有响应与落库状态一致。
+异常区段结束：active 告警 `ending` 为 null 及结束后字段形状；未越限/字段缺失/非数值以
+`record` 结束（且只结束一次、随后可再次触发新区段）、声明断档以 `gap` 结束（end_seq 为
+缺口后首条序号、无活动区段时不写结束记录）、新版本首次接管以 `version` 结束（含 buffered
+冲刷按序接管、与 record/gap 已结束时不重复结束）；buffered/重复上报/`gap_filled` 补录不
+提前结束；`active=true|false` 过滤及与 `status` 组合、多规则独立结束、结束不改告警快照与
+确认状态、`alert_ends` 主键保证每条告警最多一个结束记录、旧库启动自动建表且历史告警保持
+active，以及真实 uvicorn 服务下并发提交与并发改版本时每条告警结束记录恰好 0/1 条且
+API 与落库一致。
 告警规则版本化：创建即版本 1（自 seq 0 生效）、修改追加递增版本号并可指定生效序号、
 省略生效序号默认取 `next_expected`、直接提交与 buffered→committed 冲刷均按记录 seq
 选择唯一生效版本、新版本独立 streak、历史版本定义/状态与已生成告警冻结不变、

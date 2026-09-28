@@ -37,6 +37,29 @@ effective at the jump seq and all later ones); fully-superseded versions stay
 frozen. When a run first reaches N consecutive violations exactly one alert
 row is written and pinned to its version; the same run never fires again.
 
+Anomaly-segment end records (``alert_ends``)
+--------------------------------------------
+
+A fired segment is not over when its alert is written: it stays *active*
+until the violating run actually ends. The end is recorded separately from
+the immutable alert row (the parameter snapshot and acknowledgement state
+never change), exactly once per alert, with an end seq, server time and one
+of three reasons:
+
+* ``record``  — the next record turning committed is in-range (no violation),
+  or its watched field is missing/non-numeric. ``end_seq`` is that record.
+* ``gap``     — a gap is declared while the segment is active. ``end_seq`` is
+  the first seq after the hole (where evaluation resumes).
+* ``version`` — a newer version of the rule evaluates its first committed
+  record; the superseded version's active segment ends at that seq.
+
+Ending advances only through the commit path: duplicates, records still
+``buffered`` and ``gap_filled`` backfills can never end a segment early. The
+PRIMARY KEY on ``alert_ends.alert_id`` makes the "at most once" guarantee
+atomic; every close is a guarded INSERT inside the window engine's write
+transaction. Segments whose run simply never ends stay active forever (their
+alert has no end record).
+
 All methods run inside the caller's write transaction (db.write_txn).
 """
 from __future__ import annotations
@@ -51,6 +74,11 @@ from typing import Optional
 GT = "gt"
 LT = "lt"
 OPERATORS = (GT, LT)
+
+# Anomaly-segment end reasons stored in alert_ends.end_reason.
+END_RECORD = "record"   # committed in-range / missing-field / non-numeric record
+END_GAP = "gap"         # a gap (断档) was declared
+END_VERSION = "version"  # a newer rule version took over
 
 
 def _as_number(value) -> Optional[float]:
@@ -254,6 +282,7 @@ class AlertEngine:
         status: Optional[str] = None,
         version_no: Optional[int] = None,
         version_id: Optional[int] = None,
+        active: Optional[bool] = None,
     ) -> list[dict]:
         clauses = ["a.device_id = ?"]
         params: list = [device_id]
@@ -269,6 +298,17 @@ class AlertEngine:
         if version_id is not None:
             clauses.append("a.version_id = ?")
             params.append(version_id)
+        if active is not None:
+            # An alert is active exactly while it has no end record. The
+            # acknowledgement status is orthogonal and stays filterable.
+            if active:
+                clauses.append(
+                    "NOT EXISTS (SELECT 1 FROM alert_ends e WHERE e.alert_id = a.id)"
+                )
+            else:
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM alert_ends e WHERE e.alert_id = a.id)"
+                )
         rows = self.conn.execute(
             f"SELECT a.* FROM alerts a WHERE {' AND '.join(clauses)} ORDER BY a.id", params
         ).fetchall()
@@ -303,8 +343,11 @@ class AlertEngine:
         # existing row is returned untouched).
         return self.get_alert(device_id, alert_id)
 
-    @staticmethod
-    def _alert_dict(row) -> dict:
+    def _alert_dict(self, row) -> dict:
+        end = self.conn.execute(
+            "SELECT end_seq, end_reason, ended_at FROM alert_ends WHERE alert_id = ?",
+            (row["id"],),
+        ).fetchone()
         return {
             "alert_id": row["id"],
             "rule_id": row["rule_id"],
@@ -322,6 +365,16 @@ class AlertEngine:
             "status": row["status"],
             "acknowledged_by": row["acknowledged_by"],
             "acknowledged_at": row["acknowledged_at"],
+            # Separate segment-end record; null while the segment is active.
+            "ending": (
+                {
+                    "end_seq": end["end_seq"],
+                    "end_reason": end["end_reason"],
+                    "ended_at": end["ended_at"],
+                }
+                if end is not None
+                else None
+            ),
         }
 
     # ------------------------------------------------------------------ #
@@ -346,6 +399,13 @@ class AlertEngine:
                 # No version owns this seq (versions all start above it): the
                 # record is invisible to the rule.
                 continue
+            # A newer version evaluates this seq: the first committed record a
+            # new version takes over ends every still-active segment of the
+            # superseded versions, reason 'version'. This only fires for the
+            # takeover record itself — afterwards the old versions have no open
+            # alert left to close.
+            self._close_superseded_alerts(device_id, rule["id"], version["id"],
+                                          seq, now)
             raw = payload.get(version["field"]) if payload is not None else None
             self._advance_version(device_id, version, seq, _as_number(raw), now)
 
@@ -369,7 +429,30 @@ class AlertEngine:
         streak only ever described a completed history). The version effective
         at `at_seq` and every later version reset, including versions scheduled
         to take effect further ahead that had not evaluated anything yet.
+
+        Every active segment of those reset versions ends here with reason
+        'gap'; ``end_seq`` is `at_seq`, the first seq after the declared hole
+        where evaluation resumes. The end record and the streak reset happen in
+        the same write transaction.
         """
+        # Close active segments first: the same live-version set the UPDATE
+        # below resets — the version effective at at_seq and every later one.
+        # The alerted=1 predicate matches only versions mid-segment (an
+        # un-alerted version has no open alert) and naturally skips versions
+        # whose segment was already ended (reset) or superseded earlier.
+        self.conn.execute(
+            "INSERT INTO alert_ends (alert_id, end_seq, end_reason, ended_at) "
+            "SELECT a.id, ?, ?, ? FROM alerts a "
+            "JOIN alert_rule_versions v ON v.id = a.version_id "
+            "JOIN alert_rules r ON r.id = v.rule_id "
+            "JOIN alert_rule_state s ON s.version_id = v.id "
+            "WHERE r.device_id = ? AND s.alerted = 1 "
+            "AND v.effective_seq >= ("
+            "  SELECT COALESCE(MAX(effective_seq), 0) FROM alert_rule_versions "
+            "  WHERE rule_id = v.rule_id AND effective_seq <= ?) "
+            "AND NOT EXISTS (SELECT 1 FROM alert_ends e WHERE e.alert_id = a.id)",
+            (at_seq, END_GAP, now, device_id, at_seq),
+        )
         self.conn.execute(
             "UPDATE alert_rule_state SET streak = 0, alerted = 0, updated_at = ? "
             "WHERE version_id IN ("
@@ -399,13 +482,53 @@ class AlertEngine:
                 alerted = True
         else:
             # Normal value, missing field or non-numeric value: the run
-            # breaks and the version re-arms for the next one.
+            # breaks and the version re-arms for the next one. This first
+            # closing record also ends the fired segment once, reason 'record'.
+            if alerted:
+                self._close_latest_open_alert(version["id"], seq, END_RECORD, now)
             streak, alerted = 0, False
 
         self.conn.execute(
             "UPDATE alert_rule_state SET last_seq = ?, streak = ?, alerted = ?, "
             "updated_at = ? WHERE version_id = ?",
             (seq, streak, int(alerted), now, version["id"]),
+        )
+
+    def _close_latest_open_alert(self, version_id: int, end_seq: int,
+                                 reason: str, now: float) -> None:
+        """End this version's newest not-yet-ended alert, once.
+
+        Guarded with NOT EXISTS so a re-entrant/duplicated call can never raise
+        on the PRIMARY KEY; a segment is ended at most once.
+        """
+        self.conn.execute(
+            "INSERT INTO alert_ends (alert_id, end_seq, end_reason, ended_at) "
+            "SELECT a.id, ?, ?, ? FROM alerts a "
+            "WHERE a.version_id = ? "
+            "AND NOT EXISTS (SELECT 1 FROM alert_ends e WHERE e.alert_id = a.id) "
+            "ORDER BY a.id DESC LIMIT 1",
+            (end_seq, reason, now, version_id),
+        )
+
+    def _close_superseded_alerts(self, device_id: str, rule_id: int,
+                                 new_version_id: int, seq: int, now: float) -> None:
+        """End active segments of versions the current one just superseded.
+
+        Called for every committed record with the version effective at that
+        seq: when it differs from the versions that produced earlier active
+        segments, those segments end at `seq` with reason 'version'. Versions
+        at or after `new_version_id` (including it) are untouched, as are
+        alerts already ended. The ``effective_seq <= ?`` bound limits the set
+        to versions that actually owned records up to this takeover point.
+        """
+        self.conn.execute(
+            "INSERT INTO alert_ends (alert_id, end_seq, end_reason, ended_at) "
+            "SELECT a.id, ?, ?, ? FROM alerts a "
+            "JOIN alert_rule_versions v ON v.id = a.version_id "
+            "WHERE a.device_id = ? AND a.rule_id = ? AND v.id < ? "
+            "AND v.effective_seq <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM alert_ends e WHERE e.alert_id = a.id)",
+            (seq, END_VERSION, now, device_id, rule_id, new_version_id, seq),
         )
 
     def _fire(self, device_id: str, version, seq: int, streak: int,
