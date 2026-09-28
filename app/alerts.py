@@ -37,6 +37,23 @@ effective at the jump seq and all later ones); fully-superseded versions stay
 frozen. When a run first reaches N consecutive violations exactly one alert
 row is written and pinned to its version; the same run never fires again.
 
+Once a run has fired, its alert is *active* until the violating segment ends.
+The terminator is recorded separately in `alert_closings` (the alert row and
+its acknowledgement state are never rewritten):
+
+* 'record'  — the first committed record that no longer violates (a normal
+  value, a missing field or a non-numeric value), at that record's seq;
+* 'gap'     — a 断档 declared before the run could continue; end_seq is the
+  last seq of the declared hole (the new run can only resume past it);
+* 'version' — the first committed record taken over by a newer rule version
+  ends the old version's segment, at the takeover record's seq.
+
+Each alert is closed at most once (PRIMARY KEY on alert_closings.alert_id +
+INSERT OR IGNORE): the first terminator wins, even when several apply within
+the same drain. Closure is driven exclusively by first-time commits and by
+gap declaration, so duplicates, still-buffered records and gap_filled
+backfills can never close a segment early.
+
 All methods run inside the caller's write transaction (db.write_txn).
 """
 from __future__ import annotations
@@ -51,6 +68,11 @@ from typing import Optional
 GT = "gt"
 LT = "lt"
 OPERATORS = (GT, LT)
+
+# Segment-closing reasons persisted in alert_closings.
+CLOSE_RECORD = "record"    # first committed non-violating record ended the segment
+CLOSE_GAP = "gap"          # a declared 断档 ended the segment
+CLOSE_VERSION = "version"  # a newer rule version took over the first later record
 
 
 def _as_number(value) -> Optional[float]:
@@ -254,6 +276,7 @@ class AlertEngine:
         status: Optional[str] = None,
         version_no: Optional[int] = None,
         version_id: Optional[int] = None,
+        active: Optional[bool] = None,
     ) -> list[dict]:
         clauses = ["a.device_id = ?"]
         params: list = [device_id]
@@ -269,15 +292,27 @@ class AlertEngine:
         if version_id is not None:
             clauses.append("a.version_id = ?")
             params.append(version_id)
+        if active is not None:
+            # Active = fired segment not yet ended: no closing row exists.
+            clauses.append(
+                "c.alert_id IS NOT NULL" if not active else "c.alert_id IS NULL"
+            )
         rows = self.conn.execute(
-            f"SELECT a.* FROM alerts a WHERE {' AND '.join(clauses)} ORDER BY a.id", params
+            f"SELECT a.*, c.end_seq AS close_end_seq, c.reason AS close_reason, "
+            f"c.ended_at AS close_ended_at FROM alerts a "
+            f"LEFT JOIN alert_closings c ON c.alert_id = a.id "
+            f"WHERE {' AND '.join(clauses)} ORDER BY a.id",
+            params,
         ).fetchall()
         return [self._alert_dict(r) for r in rows]
 
     def get_alert(self, device_id: str, alert_id: int) -> Optional[dict]:
         """Fetch one device-scoped alert, or None when it does not exist."""
         row = self.conn.execute(
-            "SELECT * FROM alerts WHERE device_id = ? AND id = ?",
+            "SELECT a.*, c.end_seq AS close_end_seq, c.reason AS close_reason, "
+            "c.ended_at AS close_ended_at FROM alerts a "
+            "LEFT JOIN alert_closings c ON c.alert_id = a.id "
+            "WHERE a.device_id = ? AND a.id = ?",
             (device_id, alert_id),
         ).fetchone()
         return self._alert_dict(row) if row is not None else None
@@ -305,6 +340,16 @@ class AlertEngine:
 
     @staticmethod
     def _alert_dict(row) -> dict:
+        # The closing record is stored separately; an alert without one is an
+        # active (segment still open) alert. The acknowledgement state on the
+        # alert row is independent and untouched by a closing.
+        closing = None
+        if row["close_reason"] is not None:
+            closing = {
+                "end_seq": row["close_end_seq"],
+                "reason": row["close_reason"],
+                "ended_at": row["close_ended_at"],
+            }
         return {
             "alert_id": row["id"],
             "rule_id": row["rule_id"],
@@ -322,6 +367,8 @@ class AlertEngine:
             "status": row["status"],
             "acknowledged_by": row["acknowledged_by"],
             "acknowledged_at": row["acknowledged_at"],
+            "active": closing is None,
+            "closing": closing,
         }
 
     # ------------------------------------------------------------------ #
@@ -346,6 +393,11 @@ class AlertEngine:
                 # No version owns this seq (versions all start above it): the
                 # record is invisible to the rule.
                 continue
+            # Version handover: this is the first committed record the new
+            # version owns, so the previous version's still-open segment ends
+            # here with reason 'version'. Done before advancing so a record
+            # that itself ends the segment can only ever record one closing.
+            self._close_older_versions(rule["id"], version["id"], seq, CLOSE_VERSION, now)
             raw = payload.get(version["field"]) if payload is not None else None
             self._advance_version(device_id, version, seq, _as_number(raw), now)
 
@@ -362,22 +414,83 @@ class AlertEngine:
             (rule_id, seq),
         ).fetchone()
 
-    def on_gap_declared(self, device_id: str, at_seq: int, now: float) -> None:
-        """A declared 断档 breaks runs of every live version.
+    def on_gap_declared(self, device_id: str, at_seq: int, gap_start_seq: int,
+                        gap_end_seq: int, now: float) -> None:
+        """A declared 断档 breaks runs and ends the segments it cut off.
 
-        Versions already fully superseded before `at_seq` are frozen (their
-        streak only ever described a completed history). The version effective
-        at `at_seq` and every later version reset, including versions scheduled
-        to take effect further ahead that had not evaluated anything yet.
+        Streak reset targets the versions that can still evaluate after the
+        jump: the one effective at `at_seq` (resume seq) and every later one.
+        Versions already fully superseded before `at_seq` stay frozen, as
+        before. Closing is broader: the hole spans [gap_start_seq, gap_end_seq],
+        so any still-open alert fired by the version effective at the gap's
+        start or a later version is terminated by the gap itself — including a
+        version superseded only by a newer one scheduled *inside* the hole
+        (which never evaluates before the jump); without this, that old
+        segment could stay active forever waiting for a takeover record that
+        belongs to a different lifecycle. `gap_end_seq` is recorded as the
+        segment's end seq: the run can only resume past the hole.
+        """
+        reset_version_ids = [
+            r["id"]
+            for r in self.conn.execute(
+                "SELECT v.id FROM alert_rule_versions v JOIN alert_rules r ON r.id = v.rule_id "
+                "WHERE r.device_id = ? AND v.effective_seq >= ("
+                "  SELECT COALESCE(MAX(effective_seq), 0) FROM alert_rule_versions "
+                "  WHERE rule_id = v.rule_id AND effective_seq <= ?)",
+                (device_id, at_seq),
+            ).fetchall()
+        ]
+        close_version_ids = [
+            r["id"]
+            for r in self.conn.execute(
+                "SELECT v.id FROM alert_rule_versions v JOIN alert_rules r ON r.id = v.rule_id "
+                "WHERE r.device_id = ? AND v.effective_seq >= ("
+                "  SELECT COALESCE(MAX(effective_seq), 0) FROM alert_rule_versions "
+                "  WHERE rule_id = v.rule_id AND effective_seq <= ?)",
+                (device_id, gap_start_seq),
+            ).fetchall()
+        ]
+        # Close first (broader set), then reset the still-live streaks. Either
+        # INSERT OR IGNORE is a no-op for alerts already closed, so the overlap
+        # of the two sets is harmless and every alert closes at most once.
+        if close_version_ids:
+            self._close_versions(close_version_ids, gap_end_seq, CLOSE_GAP, now)
+        if reset_version_ids:
+            placeholders = ",".join("?" for _ in reset_version_ids)
+            self.conn.execute(
+                f"UPDATE alert_rule_state SET streak = 0, alerted = 0, updated_at = ? "
+                f"WHERE version_id IN ({placeholders})",
+                (now, *reset_version_ids),
+            )
+
+    def _close_older_versions(self, rule_id: int, current_version_id: int,
+                              end_seq: int, reason: str, now: float) -> None:
+        """Close still-open alerts of every older version of one rule.
+
+        Called when `current_version_id` evaluates its first committed record:
+        the previous version can never evaluate again, so any segment it still
+        had open ends at this takeover record.
         """
         self.conn.execute(
-            "UPDATE alert_rule_state SET streak = 0, alerted = 0, updated_at = ? "
-            "WHERE version_id IN ("
-            "  SELECT v.id FROM alert_rule_versions v JOIN alert_rules r ON r.id = v.rule_id "
-            "  WHERE r.device_id = ? AND v.effective_seq >= ("
-            "    SELECT COALESCE(MAX(effective_seq), 0) FROM alert_rule_versions "
-            "    WHERE rule_id = v.rule_id AND effective_seq <= ?))",
-            (now, device_id, at_seq),
+            "INSERT OR IGNORE INTO alert_closings (alert_id, end_seq, reason, ended_at) "
+            "SELECT a.id, ?, ?, ? FROM alerts a WHERE a.rule_id = ? "
+            "AND a.version_id < ? AND NOT EXISTS ("
+            "  SELECT 1 FROM alert_closings c WHERE c.alert_id = a.id)",
+            (end_seq, reason, now, rule_id, current_version_id),
+        )
+
+    def _close_versions(self, version_ids: list[int], end_seq: int,
+                        reason: str, now: float) -> None:
+        """Close every still-open alert fired by any of the given versions."""
+        if not version_ids:
+            return
+        placeholders = ",".join("?" for _ in version_ids)
+        self.conn.execute(
+            f"INSERT OR IGNORE INTO alert_closings (alert_id, end_seq, reason, ended_at) "
+            f"SELECT a.id, ?, ?, ? FROM alerts a WHERE a.version_id IN ({placeholders}) "
+            f"AND NOT EXISTS ("
+            f"  SELECT 1 FROM alert_closings c WHERE c.alert_id = a.id)",
+            (end_seq, reason, now, *version_ids),
         )
 
     def _advance_version(self, device_id: str, version, seq: int,
@@ -399,7 +512,11 @@ class AlertEngine:
                 alerted = True
         else:
             # Normal value, missing field or non-numeric value: the run
-            # breaks and the version re-arms for the next one.
+            # breaks and the version re-arms for the next one. If the run
+            # that just ended had already fired, this first non-violating
+            # record closes its alert with reason 'record'.
+            if alerted:
+                self._close_versions([version["id"]], seq, CLOSE_RECORD, now)
             streak, alerted = 0, False
 
         self.conn.execute(

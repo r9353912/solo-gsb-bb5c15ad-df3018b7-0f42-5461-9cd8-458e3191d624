@@ -128,6 +128,17 @@ class AlertVersionList(BaseModel):
     versions: list[AlertVersionOut]
 
 
+class AlertClosingOut(BaseModel):
+    # End-of-segment record, persisted separately from the immutable alert
+    # snapshot. An alert is closed at most once.
+    end_seq: int    # seq that ended the violating segment
+    # 'record': first committed non-violating/missing/non-numeric record;
+    # 'gap': a declared 断档 ended the segment; 'version': a newer rule
+    # version took over the first later committed record.
+    reason: Literal["record", "gap", "version"]
+    ended_at: float
+
+
 class AlertOut(BaseModel):
     alert_id: int
     rule_id: int
@@ -150,6 +161,11 @@ class AlertOut(BaseModel):
     status: Literal["open", "acknowledged"]
     acknowledged_by: Optional[str] = None
     acknowledged_at: Optional[float] = None
+    # Segment lifecycle, independent of acknowledgement: active is true until
+    # the violating segment ends; closing then carries its end seq/reason/time
+    # (stored in its own table; never alters the snapshot or status above).
+    active: bool
+    closing: Optional[AlertClosingOut] = None
 
 
 class AlertAckIn(BaseModel):

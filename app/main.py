@@ -68,11 +68,13 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="Device Telemetry Ingest API",
-        version="1.1.0",
+        version="1.2.0",
         description="Local telemetry receiver with per-device sliding-window "
         "ordering, idempotent dedup, gap (断档) detection and replay, "
         "consecutive-threshold alerting on committed records with versioned "
-        "alert rules, and an idempotent alert acknowledgement workflow.",
+        "alert rules, an idempotent alert acknowledgement workflow, and "
+        "separately persisted at-most-once segment-end (active/closed) "
+        "records with reasons record/gap/version.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -399,6 +401,11 @@ def create_app(settings: Settings) -> FastAPI:
             pattern="^(open|acknowledged)$",
             description="Filter by acknowledgement state; omit to keep the full history.",
         ),
+        active: Optional[bool] = Query(
+            default=None,
+            description="Filter by segment lifecycle: true keeps only still-open "
+            "segments, false only ended ones; omit to keep the full history.",
+        ),
         version_no: Optional[int] = Query(
             default=None, ge=1,
             description="Filter by a rule's version number; requires rule_id.",
@@ -417,7 +424,7 @@ def create_app(settings: Settings) -> FastAPI:
         return AlertList(
             device_id=device_id,
             alerts=AlertEngine(conn).list_alerts(
-                device_id, rule_id, status, version_no, rule_version_id
+                device_id, rule_id, status, version_no, rule_version_id, active
             ),
         )
 

@@ -14,6 +14,11 @@ wide `alert_rules` shape, with or without the acknowledgement columns on
 `alerts`) are upgraded in place by init_db: each old rule becomes version 1
 (effective from seq 0), its state row is carried over and every historical
 alert is pinned to that version.
+
+Fired alerts are closed at most once; the end-of-run record lives in its own
+`alert_closings` table. Because it is created with CREATE TABLE IF NOT
+EXISTS in SCHEMA, an old database gains it automatically and idempotently on
+startup — pre-existing alerts simply start without a closing row (active).
 """
 from __future__ import annotations
 
@@ -123,6 +128,27 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts(device_id, id);
 -- idx_alerts_version is created after startup migrations: an old alerts table
 -- has no version_id column until _migrate_rule_versioning adds it.
+
+-- End-of-run records live in their own table, separate from the immutable
+-- alert snapshot: an alert is fired once and closed at most once. The closing
+-- describes what terminated the violating segment:
+--   'record'  - the first committed record after the fired run that does not
+--               violate (normal value / missing field / non-numeric value);
+--   'gap'     - a 断档 was declared before the run could continue;
+--   'version' - a newer rule version took over the first committed record
+--               after the run, freezing the old version's segment.
+-- end_seq/ended_at identify that terminator. The PRIMARY KEY on alert_id
+-- guarantees one closing per alert; INSERT OR IGNORE makes that idempotent
+-- under concurrent serialized transactions. The alerts row (snapshot +
+-- acknowledgement state) is never rewritten by a closing.
+CREATE TABLE IF NOT EXISTS alert_closings (
+    alert_id  INTEGER PRIMARY KEY REFERENCES alerts (id) ON DELETE CASCADE,
+    end_seq   INTEGER NOT NULL,             -- seq that ended the violating segment
+    reason    TEXT NOT NULL CHECK (reason IN ('record', 'gap', 'version')),
+    ended_at  REAL NOT NULL
+);
+-- The PRIMARY KEY index on alert_id also serves the LEFT JOIN / NOT EXISTS
+-- used by the active filter ("alerts without a closing row").
 """
 
 # Idempotent column migrations for databases created before the alerts table

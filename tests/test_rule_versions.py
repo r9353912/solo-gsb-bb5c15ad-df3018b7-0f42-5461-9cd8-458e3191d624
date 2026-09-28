@@ -281,18 +281,31 @@ def test_history_is_immutable_after_later_modifications(client):
             "effective_seq": 5})
     submit_payloads(client, "dev-a", [(5, {"hum": 99})])  # v3 alert
 
-    # the original alert is byte-for-byte unchanged: still v1 + v1 snapshot
+    # The original alert snapshot + acknowledgement fields are byte-for-byte
+    # unchanged: still v1 + v1 snapshot. Only the new segment-lifecycle fields
+    # may change: v2's first takeover record (seq 3) ends the v1 segment.
     after = alerts(client, rule_id=rule["rule_id"], version_no=1)
     assert len(after) == 1
-    assert after[0] == before
+    for key in set(after[0]) - {"active", "closing"}:
+        assert after[0][key] == before[key]
     assert after[0]["field"] == "temp"
     assert after[0]["op"] == "gt"
+    assert after[0]["active"] is False
+    assert after[0]["closing"] == {
+        "reason": "version",
+        "end_seq": 3,
+        "ended_at": after[0]["closing"]["ended_at"],
+    }
+    assert after[0]["closing"]["ended_at"] >= before["created_at"]
 
     # v1 version definition itself stays frozen
     v1 = versions(client, rule["rule_id"])[0]
     assert (v1["field"], v1["op"], v1["threshold"], v1["consecutive"]) == (
         "temp", "gt", 30.0, 2)
     assert [a["version_no"] for a in alerts(client)] == [1, 3]
+    # the later v3 takeover cannot close the already-closed v1 alert again
+    assert after[0]["closing"]["reason"] == "version"
+    assert after[0]["closing"]["end_seq"] == 3
 
 
 # --------------------------------------------------------------------- #

@@ -25,7 +25,8 @@ Semantics
 
 Every first-time transition to `committed` (direct commit or buffered drain)
 feeds the device's alert rules in ascending seq order, and declaring a gap
-breaks their consecutive runs (see alerts.py).
+breaks their consecutive runs (see alerts.py); a fired segment's ending is
+recorded separately (record / gap / version) at most once.
 
 All public methods must be called inside a write transaction (db.write_txn),
 so concurrent batches for the same device serialize through SQLite.
@@ -283,8 +284,12 @@ class WindowEngine:
             )
             # The hole will never be committed, so it breaks every alert run
             # that still has records in flight (the version effective at the
-            # new frontier and any later scheduled version).
-            self.alerter.on_gap_declared(device_id, row["seq"], now)
+            # new frontier and any later scheduled version); any fired segment
+            # the hole cut off is closed with reason 'gap' ending at the last
+            # missing seq.
+            self.alerter.on_gap_declared(
+                device_id, row["seq"], dev["next_expected"], row["seq"] - 1, now
+            )
             self.conn.execute(
                 "UPDATE devices SET next_expected = ?, gap_since = NULL, updated_at = ? "
                 "WHERE device_id = ?",
